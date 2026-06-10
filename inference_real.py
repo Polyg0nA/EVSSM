@@ -29,6 +29,10 @@ def tile_inference(model, img, tile_size=1024, overlap=128):
     h_starts = sorted(list(set(h_starts)))
     w_starts = sorted(list(set(w_starts)))
     
+    total_tiles = len(h_starts) * len(w_starts)
+    
+    # 使用 tqdm 顯示內部切片處理進度
+    pbar = tqdm(total=total_tiles, desc="  分塊處理中", leave=False)
     for hs in h_starts:
         for ws in w_starts:
             # 裁剪當前分塊
@@ -59,7 +63,9 @@ def tile_inference(model, img, tile_size=1024, overlap=128):
             # 累加結果與權重
             output[:, :, hs:hs+th, ws:ws+tw] += tile_pred * tile_mask
             weight_mask[:, :, hs:hs+th, ws:ws+tw] += tile_mask
+            pbar.update(1)
             
+    pbar.close()
     # 除以總權重以平滑融合重疊區域
     output /= (weight_mask + 1e-8)
     return output
@@ -82,6 +88,10 @@ def main():
     model = EVSSM()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"目前使用的硬體裝置為: {device}")
+    if device.type == 'cpu':
+        print("⚠️ 警告：目前沒有偵測到 GPU，正在使用 CPU 進行推理，速度將會非常緩慢！")
+        print("💡 提示：請確保已在 Kaggle/Colab 的 Notebook 中啟用 GPU 加速器。")
     model = model.to(device)
     
     # 載入權重
