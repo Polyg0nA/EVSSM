@@ -80,9 +80,12 @@ def main():
     parser.add_argument('--model_path', type=str, required=True, help='預訓練模型路徑 (.pth)')
     parser.add_argument('--tile_size', type=int, default=1536, help='分塊大小 (T4 GPU 推薦 1024 或 1536)')
     parser.add_argument('--overlap', type=int, default=128, help='分塊重疊像素大小')
-    parser.add_argument('--fp16', action='store_true', default=True, help='是否啟用半精度 (FP16) 加速推理')
-    parser.add_argument('--num_images', type=int, default=-1, help='限制只處理前 N 張影像，設為 -1 表示處理所有影像')
+    parser.add_argument('--no_fp16', action='store_true', help='停用半精度 (FP16)，改用無損單精度 (FP32) 進行推理，可防止高光區域產生純色色塊')
+    parser.add_argument('--num_images', type=int, default=-1, help='限制只處理前 N 張影像，設為 -1表示處理所有影像')
+    parser.add_argument('--resize', type=int, default=-1, help='將影像長邊縮放到指定大小（如 1280 或 1600），-1 表示不縮放。超大圖推薦縮放以獲得最佳效果與速度')
     args = parser.parse_args()
+    
+    fp16_enabled = not args.no_fp16
 
     # 建立輸出資料夾
     os.makedirs(args.output_dir, exist_ok=True)
@@ -126,8 +129,19 @@ def main():
     for img_path in tqdm(img_paths):
         img_name = os.path.basename(img_path)
         
-        # 讀取圖片並轉為 Tensor
+        # 讀取圖片並進行等比例縮放 (解決超高解析度下模糊跨度超出感受野的問題)
         img_pil = Image.open(img_path).convert('RGB')
+        if args.resize > 0:
+            w, h = img_pil.size
+            if max(w, h) > args.resize:
+                scale = args.resize / max(w, h)
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                # 確保尺寸是 8 的倍數，適配 U-Net 架構
+                new_w = max(8, (new_w // 8) * 8)
+                new_h = max(8, (new_h // 8) * 8)
+                img_pil = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                
         img_tensor = F.to_tensor(img_pil).unsqueeze(0).to(device) # (1, 3, H, W)
         
         # 分塊推理
@@ -135,15 +149,15 @@ def main():
             # 若影像小於分塊大小，直接推理；否則使用分塊推理
             _, _, h, w = img_tensor.shape
             if h <= args.tile_size or w <= args.tile_size:
-                with torch.amp.autocast('cuda', enabled=args.fp16):
+                with torch.amp.autocast('cuda', enabled=fp16_enabled):
                     pred = model(img_tensor).float()
             else:
-                pred = tile_inference(model, img_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=args.fp16)
+                pred = tile_inference(model, img_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=fp16_enabled)
         
         # 檢查並處理半精度下可能產生的 NaN 值 (防護機制)
         if torch.isnan(pred).any():
             print(f"\n⚠️ 警告：偵測到影像 {img_name} 的推理結果包含 NaN 值（可能由半精度 FP16 數值溢位引起）。")
-            if args.fp16:
+            if fp16_enabled:
                 print("💡 正在自動切換為單精度 (FP32) 重新進行推理以確保影像品質...")
                 with torch.inference_mode():
                     if h <= args.tile_size or w <= args.tile_size:
