@@ -119,6 +119,7 @@ def main():
     parser.add_argument('--residual_mode', action='store_true', help='啟用低解析度引導殘差去模糊模式。這能讓大圖在輸出的同時，保有低解析度的強大去模糊效果與高解析度的細節')
     parser.add_argument('--tta', action='store_true', help='啟用測試時自集成 (Test-Time Augmentation, TTA) 幾何變換平均，可加強去模糊效果與減少偽影')
     parser.add_argument('--img_indices', type=str, default='', help='指定測試的圖片編號/索引（從 0 開始，用逗號分隔，例如 0,2,5）')
+    parser.add_argument('--alpha', type=float, default=1.0, help='殘差融合放大係數。大於 1.0 (如 1.2 或 1.5) 可增強去模糊強度與銳利度')
     args = parser.parse_args()
     
     fp16_enabled = not args.no_fp16
@@ -254,11 +255,11 @@ def main():
         # 殘差模式融合 (將低解析度下獲得的去模糊 Delta 上採樣並加回原大圖)
         if args.residual_mode and args.resize > 0 and max(orig_w, orig_h) > args.resize:
             residual_low = pred_low - img_tensor_low
-            # 上採樣殘差到原始尺寸
+            # 使用 bicubic 進行更高精細的上採樣，並乘上 alpha 進行強度增強
             residual_high = torch.nn.functional.interpolate(
-                residual_low, size=(orig_h, orig_w), mode='bilinear', align_corners=False
+                residual_low, size=(orig_h, orig_w), mode='bicubic', align_corners=False
             )
-            pred = img_tensor_high + residual_high
+            pred = img_tensor_high + args.alpha * residual_high
             pred = torch.clamp(pred, 0, 1)
         else:
             pred = pred_low
@@ -305,9 +306,9 @@ def main():
                     if args.residual_mode and args.resize > 0 and max(orig_w, orig_h) > args.resize:
                         residual_low = curr_tensor_fp32 - img_tensor_low
                         residual_high = torch.nn.functional.interpolate(
-                            residual_low, size=(orig_h, orig_w), mode='bilinear', align_corners=False
+                            residual_low, size=(orig_h, orig_w), mode='bicubic', align_corners=False
                         )
-                        pred = img_tensor_high + residual_high
+                        pred = img_tensor_high + args.alpha * residual_high
                         pred = torch.clamp(pred, 0, 1)
                     else:
                         pred = curr_tensor_fp32
