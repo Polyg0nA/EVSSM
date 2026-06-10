@@ -110,6 +110,7 @@ def main():
     parser.add_argument('--iters', type=int, default=1, help='遞迴去模糊次數。對於極大晃動可試試 2 或 3 次，但可能會使影像變平滑')
     parser.add_argument('--residual_mode', action='store_true', help='啟用低解析度引導殘差去模糊模式。這能讓大圖在輸出的同時，保有低解析度的強大去模糊效果與高解析度的細節')
     parser.add_argument('--tta', action='store_true', help='啟用測試時自集成 (Test-Time Augmentation, TTA) 幾何變換平均，可加強去模糊效果與減少偽影')
+    parser.add_argument('--img_indices', type=str, default='', help='指定測試的圖片編號/索引（從 0 開始，用逗號分隔，例如 0,2,5）')
     args = parser.parse_args()
     
     fp16_enabled = not args.no_fp16
@@ -146,8 +147,26 @@ def main():
         print(f"錯誤：在 {args.input_dir} 中找不到任何影像檔案！請確認路徑或上傳影像。")
         return
     
-    # 限制處理圖片的數量，方便快速測試
-    if args.num_images > 0:
+    # 先進行檔案排序，確保編號索引順序固定
+    img_paths = sorted(img_paths)
+    
+    # 優先根據指定圖片編號進行篩選
+    if args.img_indices:
+        try:
+            indices = [int(x.strip()) for x in args.img_indices.split(',')]
+            valid_paths = []
+            for idx in indices:
+                if 0 <= idx < len(img_paths):
+                    valid_paths.append(img_paths[idx])
+                else:
+                    print(f"⚠️ 警告：索引 {idx} 超出範圍（共有 {len(img_paths)} 張影像，有效索引為 0 到 {len(img_paths)-1}）")
+            img_paths = valid_paths
+            print(f"依設定只處理索引為 {indices} 的影像，開始去模糊推理...")
+        except ValueError:
+            print("⚠️ 警告：--img_indices 格式錯誤，請使用逗號分隔的整數（例如 0,2,5）！將不限制圖片編號。")
+            
+    # 若無指定編號，才限制處理前 N 張圖片
+    elif args.num_images > 0:
         img_paths = img_paths[:args.num_images]
         print(f"依設定只處理前 {args.num_images} 張影像，開始去模糊推理...")
     else:
