@@ -81,6 +81,7 @@ def main():
     parser.add_argument('--tile_size', type=int, default=1536, help='分塊大小 (T4 GPU 推薦 1024 或 1536)')
     parser.add_argument('--overlap', type=int, default=128, help='分塊重疊像素大小')
     parser.add_argument('--fp16', action='store_true', default=True, help='是否啟用半精度 (FP16) 加速推理')
+    parser.add_argument('--num_images', type=int, default=-1, help='限制只處理前 N 張影像，設為 -1 表示處理所有影像')
     args = parser.parse_args()
 
     # 建立輸出資料夾
@@ -114,8 +115,13 @@ def main():
     if not img_paths:
         print(f"錯誤：在 {args.input_dir} 中找不到任何影像檔案！請確認路徑或上傳影像。")
         return
-
-    print(f"找到 {len(img_paths)} 張影像，開始去模糊推理...")
+    
+    # 限制處理圖片的數量，方便快速測試
+    if args.num_images > 0:
+        img_paths = img_paths[:args.num_images]
+        print(f"依設定只處理前 {args.num_images} 張影像，開始去模糊推理...")
+    else:
+        print(f"找到 {len(img_paths)} 張影像，開始去模糊推理...")
 
     for img_path in tqdm(img_paths):
         img_name = os.path.basename(img_path)
