@@ -140,6 +140,19 @@ def main():
             else:
                 pred = tile_inference(model, img_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=args.fp16)
         
+        # 檢查並處理半精度下可能產生的 NaN 值 (防護機制)
+        if torch.isnan(pred).any():
+            print(f"\n⚠️ 警告：偵測到影像 {img_name} 的推理結果包含 NaN 值（可能由半精度 FP16 數值溢位引起）。")
+            if args.fp16:
+                print("💡 正在自動切換為單精度 (FP32) 重新進行推理以確保影像品質...")
+                with torch.inference_mode():
+                    if h <= args.tile_size or w <= args.tile_size:
+                        pred = model(img_tensor).float()
+                    else:
+                        pred = tile_inference(model, img_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=False)
+            else:
+                print("❌ 錯誤：在單精度 (FP32) 下依然偵測到 NaN 值，請檢查權重或輸入圖像。")
+        
         # 後處理並保存圖片
         pred_clip = torch.clamp(pred, 0, 1) + (0.5 / 255.0)
         pred_pil = F.to_pil_image(pred_clip.squeeze(0).cpu(), 'RGB')
