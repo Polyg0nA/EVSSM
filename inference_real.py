@@ -83,6 +83,7 @@ def main():
     parser.add_argument('--no_fp16', action='store_true', help='停用半精度 (FP16)，改用無損單精度 (FP32) 進行推理，可防止高光區域產生純色色塊')
     parser.add_argument('--num_images', type=int, default=-1, help='限制只處理前 N 張影像，設為 -1表示處理所有影像')
     parser.add_argument('--resize', type=int, default=-1, help='將影像長邊縮放到指定大小（如 1280 或 1600），-1 表示不縮放。超大圖推薦縮放以獲得最佳效果與速度')
+    parser.add_argument('--iters', type=int, default=1, help='遞迴去模糊次數。對於極大晃動可試試 2 或 3 次，但可能會使影像變平滑')
     args = parser.parse_args()
     
     fp16_enabled = not args.no_fp16
@@ -144,15 +145,20 @@ def main():
                 
         img_tensor = F.to_tensor(img_pil).unsqueeze(0).to(device) # (1, 3, H, W)
         
-        # 分塊推理
-        with torch.inference_mode():
-            # 若影像小於分塊大小，直接推理；否則使用分塊推理
-            _, _, h, w = img_tensor.shape
-            if h <= args.tile_size or w <= args.tile_size:
-                with torch.amp.autocast('cuda', enabled=fp16_enabled):
-                    pred = model(img_tensor).float()
-            else:
-                pred = tile_inference(model, img_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=fp16_enabled)
+        # 進行指定次數的遞迴去模糊 (Multi-pass Deblurring)
+        curr_tensor = img_tensor.clone()
+        for it in range(args.iters):
+            with torch.inference_mode():
+                _, _, h, w = curr_tensor.shape
+                if h <= args.tile_size or w <= args.tile_size:
+                    with torch.amp.autocast('cuda', enabled=fp16_enabled):
+                        curr_tensor = model(curr_tensor).float()
+                else:
+                    curr_tensor = tile_inference(model, curr_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=fp16_enabled)
+                # 每次迭代後限制數值範圍在 0~1 之間，防止發散
+                curr_tensor = torch.clamp(curr_tensor, 0, 1)
+        
+        pred = curr_tensor
         
         # 檢查並處理半精度下可能產生的 NaN 值 (防護機制)
         if torch.isnan(pred).any():
