@@ -74,52 +74,34 @@ def tile_inference(model, img, tile_size=1024, overlap=128, fp16=False):
 
 def tta_inference(model, img, fp16=False):
     """
-    批次測試時自集成 (Batch TTA) 推理。
-    針對非正方形圖片 (H != W)，將 8 種幾何變換拆分為兩組以避免維度不匹配錯誤：
-    - 第一組 (0度與180度旋轉及翻轉)：形狀保持 (H, W)，組成 Batch=4。
-    - 第二組 (90度與270度旋轉及翻轉)：形狀轉置為 (W, H)，組成 Batch=4。
-    這可完全避免尺寸不一致的錯誤，同時享有批次運算的高速度與 GPU 並行加速。
+    測試時自集成 (TTA) 推理。
+    由於 EVSSM 模型內部硬編碼了 `assert b == 1`（在分塊裁切時限制了 Batch size 必須為 1），
+    因此我們必須以序列化方式（一次處理一張幾何變化）來執行 8 次推理。
+    我們在這裡加入內層 tqdm 進度條，讓您看清楚 TTA 融合的每一步進度。
     """
     outputs = []
-    
-    # 兩組幾何配置，每組 4 個變換
-    group1_configs = [
-        (False, 0), (False, 2), (True, 0), (True, 2)
-    ]
-    group2_configs = [
-        (False, 1), (False, 3), (True, 1), (True, 3)
-    ]
-    
-    def process_group(configs):
-        inputs = []
-        for flip, rot in configs:
-            x = img.clone()
-            if rot > 0:
-                x = torch.rot90(x, rot, [2, 3])
-            if flip:
-                x = torch.flip(x, [3])
-            inputs.append(x)
+    configs = []
+    for flip in [False, True]:
+        for rot in [0, 1, 2, 3]:
+            configs.append((flip, rot))
             
-        # 拼接成 Batch size = 4，這四個 Tensor 的尺寸完全一致
-        batch_x = torch.cat(inputs, dim=0)
+    pbar_tta = tqdm(configs, desc="    TTA幾何融合", leave=False)
+    for flip, rot in pbar_tta:
+        x = img.clone()
+        if rot > 0:
+            x = torch.rot90(x, rot, [2, 3])
+        if flip:
+            x = torch.flip(x, [3])
         
-        # 批次送入 GPU 運算
         with torch.amp.autocast('cuda', enabled=fp16):
-            batch_pred = model(batch_x).float()
-            
-        # 還原幾何變換並存入 outputs
-        for i, (flip, rot) in enumerate(configs):
-            pred = batch_pred[i:i+1] # 取出單張的 tensor, shape: (1, C, H, W)
-            if flip:
-                pred = torch.flip(pred, [3])
-            if rot > 0:
-                pred = torch.rot90(pred, -rot, [2, 3])
-            outputs.append(pred)
-            
-    # 分別處理兩組，充分利用 GPU
-    process_group(group1_configs)
-    process_group(group2_configs)
-    
+            pred = model(x).float()
+        
+        if flip:
+            pred = torch.flip(pred, [3])
+        if rot > 0:
+            pred = torch.rot90(pred, -rot, [2, 3])
+        outputs.append(pred)
+        
     return torch.stack(outputs).mean(dim=0)
 
 def main():
