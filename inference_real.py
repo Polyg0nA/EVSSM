@@ -75,39 +75,51 @@ def tile_inference(model, img, tile_size=1024, overlap=128, fp16=False):
 def tta_inference(model, img, fp16=False):
     """
     批次測試時自集成 (Batch TTA) 推理。
-    將 8 種幾何變換組合打包成一個 Batch (Batch size = 8) 一次送入 GPU，
-    以充分利用剩餘 VRAM (讓 VRAM 吃到 10GB~12GB)，大幅提升並行計算速度！
+    針對非正方形圖片 (H != W)，將 8 種幾何變換拆分為兩組以避免維度不匹配錯誤：
+    - 第一組 (0度與180度旋轉及翻轉)：形狀保持 (H, W)，組成 Batch=4。
+    - 第二組 (90度與270度旋轉及翻轉)：形狀轉置為 (W, H)，組成 Batch=4。
+    這可完全避免尺寸不一致的錯誤，同時享有批次運算的高速度與 GPU 並行加速。
     """
-    inputs = []
-    configs = []  # 儲存 (flip, rot) 的幾何配置
-    for flip in [False, True]:
-        for rot in [0, 1, 2, 3]:
+    outputs = []
+    
+    # 兩組幾何配置，每組 4 個變換
+    group1_configs = [
+        (False, 0), (False, 2), (True, 0), (True, 2)
+    ]
+    group2_configs = [
+        (False, 1), (False, 3), (True, 1), (True, 3)
+    ]
+    
+    def process_group(configs):
+        inputs = []
+        for flip, rot in configs:
             x = img.clone()
             if rot > 0:
                 x = torch.rot90(x, rot, [2, 3])
             if flip:
                 x = torch.flip(x, [3])
             inputs.append(x)
-            configs.append((flip, rot))
             
-    # 將 8 張圖像在 batch 維度拼接，shape: (8, C, H, W)
-    batch_x = torch.cat(inputs, dim=0)
+        # 拼接成 Batch size = 4，這四個 Tensor 的尺寸完全一致
+        batch_x = torch.cat(inputs, dim=0)
+        
+        # 批次送入 GPU 運算
+        with torch.amp.autocast('cuda', enabled=fp16):
+            batch_pred = model(batch_x).float()
+            
+        # 還原幾何變換並存入 outputs
+        for i, (flip, rot) in enumerate(configs):
+            pred = batch_pred[i:i+1] # 取出單張的 tensor, shape: (1, C, H, W)
+            if flip:
+                pred = torch.flip(pred, [3])
+            if rot > 0:
+                pred = torch.rot90(pred, -rot, [2, 3])
+            outputs.append(pred)
+            
+    # 分別處理兩組，充分利用 GPU
+    process_group(group1_configs)
+    process_group(group2_configs)
     
-    # 批次送入 GPU 運算
-    with torch.amp.autocast('cuda', enabled=fp16):
-        batch_pred = model(batch_x).float() # shape: (8, C, H, W)
-        
-    # 還原每張圖的幾何變換
-    outputs = []
-    for i in range(8):
-        flip, rot = configs[i]
-        pred = batch_pred[i:i+1] # 取出單張 tensor, shape: (1, C, H, W)
-        if flip:
-            pred = torch.flip(pred, [3])
-        if rot > 0:
-            pred = torch.rot90(pred, -rot, [2, 3])
-        outputs.append(pred)
-        
     return torch.stack(outputs).mean(dim=0)
 
 def main():
