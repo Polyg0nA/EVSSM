@@ -74,9 +74,12 @@ def tile_inference(model, img, tile_size=1024, overlap=128, fp16=False):
 
 def tta_inference(model, img, fp16=False):
     """
-    測試時自集成 (TTA) 推理。將圖像旋轉翻轉 8 種組合，推理後還原取平均。
+    批次測試時自集成 (Batch TTA) 推理。
+    將 8 種幾何變換組合打包成一個 Batch (Batch size = 8) 一次送入 GPU，
+    以充分利用剩餘 VRAM (讓 VRAM 吃到 10GB~12GB)，大幅提升並行計算速度！
     """
-    outputs = []
+    inputs = []
+    configs = []  # 儲存 (flip, rot) 的幾何配置
     for flip in [False, True]:
         for rot in [0, 1, 2, 3]:
             x = img.clone()
@@ -84,16 +87,27 @@ def tta_inference(model, img, fp16=False):
                 x = torch.rot90(x, rot, [2, 3])
             if flip:
                 x = torch.flip(x, [3])
+            inputs.append(x)
+            configs.append((flip, rot))
             
-            with torch.amp.autocast('cuda', enabled=fp16):
-                pred = model(x).float()
-            
-            if flip:
-                pred = torch.flip(pred, [3])
-            if rot > 0:
-                pred = torch.rot90(pred, -rot, [2, 3])
-            outputs.append(pred)
-            
+    # 將 8 張圖像在 batch 維度拼接，shape: (8, C, H, W)
+    batch_x = torch.cat(inputs, dim=0)
+    
+    # 批次送入 GPU 運算
+    with torch.amp.autocast('cuda', enabled=fp16):
+        batch_pred = model(batch_x).float() # shape: (8, C, H, W)
+        
+    # 還原每張圖的幾何變換
+    outputs = []
+    for i in range(8):
+        flip, rot = configs[i]
+        pred = batch_pred[i:i+1] # 取出單張 tensor, shape: (1, C, H, W)
+        if flip:
+            pred = torch.flip(pred, [3])
+        if rot > 0:
+            pred = torch.rot90(pred, -rot, [2, 3])
+        outputs.append(pred)
+        
     return torch.stack(outputs).mean(dim=0)
 
 def main():
@@ -197,7 +211,9 @@ def main():
             
         # 進行指定次數的遞迴去模糊 (針對低解析度影像進行，其感受野最契合)
         curr_tensor = img_tensor_low.clone()
-        for it in range(args.iters):
+        pbar_it = tqdm(range(args.iters), desc=f"  -> {img_name} 疊代", leave=False)
+        for it in pbar_it:
+            pbar_it.set_postfix(step=f"{it+1}/{args.iters}")
             with torch.inference_mode():
                 _, _, h, w = curr_tensor.shape
                 use_tile = (h > args.tile_size or w > args.tile_size)
@@ -221,6 +237,7 @@ def main():
                                 outputs_tta.append(pred_t)
                         curr_tensor = torch.stack(outputs_tta).mean(dim=0)
                     else:
+                        # 批次 TTA (平行加速)
                         curr_tensor = tta_inference(model, curr_tensor, fp16=fp16_enabled)
                 else:
                     if not use_tile:
@@ -252,12 +269,36 @@ def main():
                 print("💡 正在自動切換為單精度 (FP32) 重新進行推理以確保影像品質...")
                 with torch.inference_mode():
                     curr_tensor_fp32 = img_tensor_low.clone()
-                    for it in range(args.iters):
+                    pbar_it_fb = tqdm(range(args.iters), desc=f"  -> [修復] {img_name} 疊代", leave=False)
+                    for it in pbar_it_fb:
+                        pbar_it_fb.set_postfix(step=f"{it+1}/{args.iters}")
                         _, _, h, w = curr_tensor_fp32.shape
-                        if h <= args.tile_size or w <= args.tile_size:
-                            curr_tensor_fp32 = model(curr_tensor_fp32).float()
+                        use_tile = (h > args.tile_size or w > args.tile_size)
+                        
+                        if args.tta:
+                            if use_tile:
+                                outputs_tta = []
+                                for flip in [False, True]:
+                                    for rot in [0, 1, 2, 3]:
+                                        x = curr_tensor_fp32.clone()
+                                        if rot > 0:
+                                            x = torch.rot90(x, rot, [2, 3])
+                                        if flip:
+                                            x = torch.flip(x, [3])
+                                        pred_t = tile_inference(model, x, tile_size=args.tile_size, overlap=args.overlap, fp16=False)
+                                        if flip:
+                                            pred_t = torch.flip(pred_t, [3])
+                                        if rot > 0:
+                                            pred_t = torch.rot90(pred_t, -rot, [2, 3])
+                                        outputs_tta.append(pred_t)
+                                curr_tensor_fp32 = torch.stack(outputs_tta).mean(dim=0)
+                            else:
+                                curr_tensor_fp32 = tta_inference(model, curr_tensor_fp32, fp16=False)
                         else:
-                            curr_tensor_fp32 = tile_inference(model, curr_tensor_fp32, tile_size=args.tile_size, overlap=args.overlap, fp16=False)
+                            if not use_tile:
+                                curr_tensor_fp32 = model(curr_tensor_fp32).float()
+                            else:
+                                curr_tensor_fp32 = tile_inference(model, curr_tensor_fp32, tile_size=args.tile_size, overlap=args.overlap, fp16=False)
                         curr_tensor_fp32 = torch.clamp(curr_tensor_fp32, 0, 1)
                     
                     if args.residual_mode and args.resize > 0 and max(orig_w, orig_h) > args.resize:
