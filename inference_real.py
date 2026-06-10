@@ -7,7 +7,7 @@ from PIL import Image
 from tqdm import tqdm
 from models.EVSSM import EVSSM
 
-def tile_inference(model, img, tile_size=1024, overlap=128):
+def tile_inference(model, img, tile_size=1024, overlap=128, fp16=False):
     """
     分塊推理 (Tiled Inference) 函數，用於處理大圖以防 VRAM 爆炸 (OOM)。
     img: torch.Tensor, shape (1, C, H, W)
@@ -38,9 +38,11 @@ def tile_inference(model, img, tile_size=1024, overlap=128):
             # 裁剪當前分塊
             tile = img[:, :, hs:hs+tile_size, ws:ws+tile_size]
             
-            # 模型推理
-            with torch.no_grad():
+            # 模型推理 (使用半精度與推理模式優化速度)
+            with torch.inference_mode(), torch.cuda.amp.autocast(enabled=fp16):
                 tile_pred = model(tile)
+                # 確保返回的是 float32 以便後續權重計算
+                tile_pred = tile_pred.float()
             
             # 建立線性漸變的權重遮罩，防止邊界縫隙
             th, tw = tile.shape[2], tile.shape[3]
@@ -76,8 +78,9 @@ def main():
     parser.add_argument('--input_dir', type=str, default='./my_inputs/', help='輸入模糊影像資料夾')
     parser.add_argument('--output_dir', type=str, default='./my_outputs/', help='輸出去模糊影像資料夾')
     parser.add_argument('--model_path', type=str, required=True, help='預訓練模型路徑 (.pth)')
-    parser.add_argument('--tile_size', type=int, default=1024, help='分塊大小 (越小越省記憶體)')
+    parser.add_argument('--tile_size', type=int, default=1536, help='分塊大小 (T4 GPU 推薦 1024 或 1536)')
     parser.add_argument('--overlap', type=int, default=128, help='分塊重疊像素大小')
+    parser.add_argument('--fp16', action='store_true', default=True, help='是否啟用半精度 (FP16) 加速推理')
     args = parser.parse_args()
 
     # 建立輸出資料夾
@@ -122,13 +125,14 @@ def main():
         img_tensor = F.to_tensor(img_pil).unsqueeze(0).to(device) # (1, 3, H, W)
         
         # 分塊推理
-        with torch.no_grad():
+        with torch.inference_mode():
             # 若影像小於分塊大小，直接推理；否則使用分塊推理
             _, _, h, w = img_tensor.shape
             if h <= args.tile_size or w <= args.tile_size:
-                pred = model(img_tensor)
+                with torch.cuda.amp.autocast(enabled=args.fp16):
+                    pred = model(img_tensor).float()
             else:
-                pred = tile_inference(model, img_tensor, tile_size=args.tile_size, overlap=args.overlap)
+                pred = tile_inference(model, img_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=args.fp16)
         
         # 後處理並保存圖片
         pred_clip = torch.clamp(pred, 0, 1) + (0.5 / 255.0)
