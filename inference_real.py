@@ -123,8 +123,15 @@ def main():
     
     fp16_enabled = not args.no_fp16
 
-    # 建立輸出資料夾
+    # 建立並清理輸出資料夾，避免殘留上一次執行的圖片
     os.makedirs(args.output_dir, exist_ok=True)
+    for file in os.listdir(args.output_dir):
+        file_path = os.path.join(args.output_dir, file)
+        try:
+            if os.path.isfile(file_path):
+                os.unlink(file_path)
+        except Exception as e:
+            print(f"⚠️ 警告：無法刪除舊檔案 {file_path}: {e}")
 
     # 載入模型
     print("正在載入 EVSSM 模型...")
