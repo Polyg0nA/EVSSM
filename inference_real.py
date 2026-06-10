@@ -72,6 +72,30 @@ def tile_inference(model, img, tile_size=1024, overlap=128, fp16=False):
     output /= (weight_mask + 1e-8)
     return output
 
+def tta_inference(model, img, fp16=False):
+    """
+    測試時自集成 (TTA) 推理。將圖像旋轉翻轉 8 種組合，推理後還原取平均。
+    """
+    outputs = []
+    for flip in [False, True]:
+        for rot in [0, 1, 2, 3]:
+            x = img.clone()
+            if rot > 0:
+                x = torch.rot90(x, rot, [2, 3])
+            if flip:
+                x = torch.flip(x, [3])
+            
+            with torch.amp.autocast('cuda', enabled=fp16):
+                pred = model(x).float()
+            
+            if flip:
+                pred = torch.flip(pred, [3])
+            if rot > 0:
+                pred = torch.rot90(pred, -rot, [2, 3])
+            outputs.append(pred)
+            
+    return torch.stack(outputs).mean(dim=0)
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="EVSSM 大圖推理腳本")
@@ -85,6 +109,7 @@ def main():
     parser.add_argument('--resize', type=int, default=-1, help='將影像長邊縮放到指定大小（如 1280 或 1600），-1 表示不縮放。超大圖推薦縮放以獲得最佳效果與速度')
     parser.add_argument('--iters', type=int, default=1, help='遞迴去模糊次數。對於極大晃動可試試 2 或 3 次，但可能會使影像變平滑')
     parser.add_argument('--residual_mode', action='store_true', help='啟用低解析度引導殘差去模糊模式。這能讓大圖在輸出的同時，保有低解析度的強大去模糊效果與高解析度的細節')
+    parser.add_argument('--tta', action='store_true', help='啟用測試時自集成 (Test-Time Augmentation, TTA) 幾何變換平均，可加強去模糊效果與減少偽影')
     args = parser.parse_args()
     
     fp16_enabled = not args.no_fp16
@@ -156,11 +181,34 @@ def main():
         for it in range(args.iters):
             with torch.inference_mode():
                 _, _, h, w = curr_tensor.shape
-                if h <= args.tile_size or w <= args.tile_size:
-                    with torch.amp.autocast('cuda', enabled=fp16_enabled):
-                        curr_tensor = model(curr_tensor).float()
+                use_tile = (h > args.tile_size or w > args.tile_size)
+                
+                if args.tta:
+                    if use_tile:
+                        # 對分塊進行 TTA
+                        outputs_tta = []
+                        for flip in [False, True]:
+                            for rot in [0, 1, 2, 3]:
+                                x = curr_tensor.clone()
+                                if rot > 0:
+                                    x = torch.rot90(x, rot, [2, 3])
+                                if flip:
+                                    x = torch.flip(x, [3])
+                                pred_t = tile_inference(model, x, tile_size=args.tile_size, overlap=args.overlap, fp16=fp16_enabled)
+                                if flip:
+                                    pred_t = torch.flip(pred_t, [3])
+                                if rot > 0:
+                                    pred_t = torch.rot90(pred_t, -rot, [2, 3])
+                                outputs_tta.append(pred_t)
+                        curr_tensor = torch.stack(outputs_tta).mean(dim=0)
+                    else:
+                        curr_tensor = tta_inference(model, curr_tensor, fp16=fp16_enabled)
                 else:
-                    curr_tensor = tile_inference(model, curr_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=fp16_enabled)
+                    if not use_tile:
+                        with torch.amp.autocast('cuda', enabled=fp16_enabled):
+                            curr_tensor = model(curr_tensor).float()
+                    else:
+                        curr_tensor = tile_inference(model, curr_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=fp16_enabled)
                 # 每次迭代後限制數值範圍在 0~1 之間，防止發散
                 curr_tensor = torch.clamp(curr_tensor, 0, 1)
         
