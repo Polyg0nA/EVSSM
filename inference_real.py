@@ -39,7 +39,7 @@ def tile_inference(model, img, tile_size=1024, overlap=128, fp16=False):
             tile = img[:, :, hs:hs+tile_size, ws:ws+tile_size]
             
             # 模型推理 (使用半精度與推理模式優化速度)
-            with torch.inference_mode(), torch.cuda.amp.autocast(enabled=fp16):
+            with torch.inference_mode(), torch.amp.autocast('cuda', enabled=fp16):
                 tile_pred = model(tile)
                 # 確保返回的是 float32 以便後續權重計算
                 tile_pred = tile_pred.float()
@@ -129,7 +129,7 @@ def main():
             # 若影像小於分塊大小，直接推理；否則使用分塊推理
             _, _, h, w = img_tensor.shape
             if h <= args.tile_size or w <= args.tile_size:
-                with torch.cuda.amp.autocast(enabled=args.fp16):
+                with torch.amp.autocast('cuda', enabled=args.fp16):
                     pred = model(img_tensor).float()
             else:
                 pred = tile_inference(model, img_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=args.fp16)
