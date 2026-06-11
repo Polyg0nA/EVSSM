@@ -104,64 +104,42 @@ def tta_inference(model, img, fp16=False):
         
     return torch.stack(outputs).mean(dim=0)
 
-def run_deblur_on_scale(model, img_pil, target_resize, orig_w, orig_h, args, fp16_enabled, device, img_name=""):
+def deblur_one_step(model, img_tensor, args, device):
     """
-    對指定尺寸進行去模糊推理的輔助函數。
+    對輸入的 Tensor 執行單次去模糊推理（支援 TTA 與 Tiled Inference）。
     """
-    # 進行縮放 (適配感受野)
-    if target_resize > 0 and max(orig_w, orig_h) > target_resize:
-        scale = target_resize / max(orig_w, orig_h)
-        new_w = int(orig_w * scale)
-        new_h = int(orig_h * scale)
-        # 確保尺寸是 8 的倍數
-        new_w = max(8, (new_w // 8) * 8)
-        new_h = max(8, (new_h // 8) * 8)
-        img_pil_low = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        img_tensor_low = F.to_tensor(img_pil_low).unsqueeze(0).to(device)
-        scale_desc = f"{new_w}x{new_h}"
+    _, _, h, w = img_tensor.shape
+    use_tile = (h > args.tile_size or w > args.tile_size)
+    
+    if args.tta:
+        if use_tile:
+            # 對分塊進行 TTA
+            outputs_tta = []
+            for flip in [False, True]:
+                for rot in [0, 1, 2, 3]:
+                    x = img_tensor.clone()
+                    if rot > 0:
+                        x = torch.rot90(x, rot, [2, 3])
+                    if flip:
+                        x = torch.flip(x, [3])
+                    pred_t = tile_inference(model, x, tile_size=args.tile_size, overlap=args.overlap, fp16=False)
+                    if flip:
+                        pred_t = torch.flip(pred_t, [3])
+                    if rot > 0:
+                        pred_t = torch.rot90(pred_t, -rot, [2, 3])
+                    outputs_tta.append(pred_t)
+            pred = torch.stack(outputs_tta).mean(dim=0)
+        else:
+            # 批次 TTA (平行加速)
+            pred = tta_inference(model, img_tensor, fp16=False)
     else:
-        img_tensor_low = F.to_tensor(img_pil).unsqueeze(0).to(device)
-        scale_desc = "原圖"
-        
-    curr_tensor = img_tensor_low.clone()
-    pbar_it = tqdm(range(args.iters), desc=f"  -> {img_name} ({scale_desc}) 疊代", leave=False)
-    for it in pbar_it:
-        pbar_it.set_postfix(step=f"{it+1}/{args.iters}")
-        with torch.inference_mode():
-            _, _, h, w = curr_tensor.shape
-            use_tile = (h > args.tile_size or w > args.tile_size)
+        if not use_tile:
+            with torch.inference_mode():
+                pred = model(img_tensor).float()
+        else:
+            pred = tile_inference(model, img_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=False)
             
-            if args.tta:
-                if use_tile:
-                    # 對分塊進行 TTA
-                    outputs_tta = []
-                    for flip in [False, True]:
-                        for rot in [0, 1, 2, 3]:
-                            x = curr_tensor.clone()
-                            if rot > 0:
-                                x = torch.rot90(x, rot, [2, 3])
-                            if flip:
-                                x = torch.flip(x, [3])
-                            pred_t = tile_inference(model, x, tile_size=args.tile_size, overlap=args.overlap, fp16=fp16_enabled)
-                            if flip:
-                                pred_t = torch.flip(pred_t, [3])
-                            if rot > 0:
-                                pred_t = torch.rot90(pred_t, -rot, [2, 3])
-                            outputs_tta.append(pred_t)
-                    curr_tensor = torch.stack(outputs_tta).mean(dim=0)
-                else:
-                    # 批次 TTA (平行加速)
-                    curr_tensor = tta_inference(model, curr_tensor, fp16=fp16_enabled)
-            else:
-                if not use_tile:
-                    with torch.amp.autocast('cuda', enabled=fp16_enabled):
-                        curr_tensor = model(curr_tensor).float()
-                else:
-                    curr_tensor = tile_inference(model, curr_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=fp16_enabled)
-            # 每次迭代後限制數值範圍在 0~1 之間，防止發散
-            curr_tensor = torch.clamp(curr_tensor, 0, 1)
-            
-    return curr_tensor, img_tensor_low
+    return torch.clamp(pred, 0, 1)
 
 def main():
     import argparse
@@ -272,8 +250,8 @@ def main():
         # 原始高解析度影像 Tensor
         img_tensor_high = F.to_tensor(img_pil).unsqueeze(0).to(device)
         
-        # 定義多尺度處理閉包，以便支援 FP32 NaN 容錯機制
-        def process_image_scales(fp16_active):
+        # 定義多尺度處理閉包
+        def process_image_scales():
             # 檢查是否需要啟用殘差模式：
             # 1. 使用者明確啟用 --residual_mode
             # 2. 或者有多個尺度需要融合
@@ -282,37 +260,68 @@ def main():
             # 如果不需要殘差模式（即單一尺度且未使用殘差模式）
             if not use_residual:
                 scale_val = scale_list[0]
-                pred_low, _ = run_deblur_on_scale(model, img_pil, scale_val, orig_w, orig_h, args, fp16_active, device, img_name)
-                return pred_low
-            
-            # 使用殘差模式進行多尺度/單一尺度去模糊與融合
-            upsampled_residuals = []
-            
-            for scale_val in scale_list:
-                pred_low, img_tensor_low = run_deblur_on_scale(model, img_pil, scale_val, orig_w, orig_h, args, fp16_active, device, img_name)
-                
-                # 計算殘差 (去模糊結果 - 輸入)
-                residual_low = pred_low - img_tensor_low
-                
-                # 將殘差上採樣回原始高解析度大小
-                if residual_low.shape[2] != orig_h or residual_low.shape[3] != orig_w:
-                    residual_high = torch.nn.functional.interpolate(
-                        residual_low, size=(orig_h, orig_w), mode='bicubic', align_corners=False
-                    )
+                if scale_val > 0 and max(orig_w, orig_h) > scale_val:
+                    scale = scale_val / max(orig_w, orig_h)
+                    new_w = max(8, ((int(orig_w * scale)) // 8) * 8)
+                    new_h = max(8, ((int(orig_h * scale)) // 8) * 8)
+                    img_pil_low = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                    curr_tensor = F.to_tensor(img_pil_low).unsqueeze(0).to(device)
+                    scale_desc = f"{new_w}x{new_h}"
                 else:
-                    residual_high = residual_low
+                    curr_tensor = img_tensor_high.clone()
+                    scale_desc = "原圖"
                 
-                upsampled_residuals.append(residual_high)
+                pbar_it = tqdm(range(args.iters), desc=f"  -> {img_name} ({scale_desc}) 疊代", leave=False)
+                for it in pbar_it:
+                    pbar_it.set_postfix(step=f"{it+1}/{args.iters}")
+                    curr_tensor = deblur_one_step(model, curr_tensor, args, device)
+                return curr_tensor
             
-            # 融合所有尺度的殘差 (取平均)
-            fused_residual = torch.stack(upsampled_residuals).mean(dim=0)
-            
-            # 疊加到原始高解析度影像，並用 alpha 調整強度
-            pred_high = img_tensor_high + args.alpha * fused_residual
-            return torch.clamp(pred_high, 0, 1)
+            # 交織多尺度殘差疊代反饋機制
+            curr_high_tensor = img_tensor_high.clone()
+            pbar_it = tqdm(range(args.iters), desc=f"  -> {img_name} (多尺度交織疊代)", leave=False)
+            for it in pbar_it:
+                pbar_it.set_postfix(step=f"{it+1}/{args.iters}")
+                upsampled_residuals = []
+                
+                for scale_val in scale_list:
+                    # 1. 下採樣當前的中間高解析度 Tensor 到該尺度
+                    if scale_val > 0 and max(orig_w, orig_h) > scale_val:
+                        scale = scale_val / max(orig_w, orig_h)
+                        new_w = max(8, ((int(orig_w * scale)) // 8) * 8)
+                        new_h = max(8, ((int(orig_h * scale)) // 8) * 8)
+                        img_tensor_low = torch.nn.functional.interpolate(
+                            curr_high_tensor, size=(new_h, new_w), mode='bilinear', align_corners=False
+                        )
+                    else:
+                        img_tensor_low = curr_high_tensor.clone()
+                    
+                    # 2. 進行單次模型去模糊推理
+                    pred_low = deblur_one_step(model, img_tensor_low, args, device)
+                    
+                    # 3. 計算本次尺度的去模糊殘差 (去模糊結果 - 本次輸入)
+                    residual_low = pred_low - img_tensor_low
+                    
+                    # 4. 上採樣殘差回原始尺寸
+                    if residual_low.shape[2] != orig_h or residual_low.shape[3] != orig_w:
+                        residual_high = torch.nn.functional.interpolate(
+                            residual_low, size=(orig_h, orig_w), mode='bicubic', align_corners=False
+                        )
+                    else:
+                        residual_high = residual_low
+                    
+                    upsampled_residuals.append(residual_high)
+                
+                # 融合本輪所有尺度的殘差 (取平均)
+                fused_residual = torch.stack(upsampled_residuals).mean(dim=0)
+                
+                # 將融合殘差加回當前大圖，更新 curr_high_tensor 做為下一輪疊代的輸入
+                curr_high_tensor = torch.clamp(curr_high_tensor + args.alpha * fused_residual, 0, 1)
+                
+            return curr_high_tensor
         
         # 執行主處理流程
-        pred = process_image_scales(fp16_enabled)
+        pred = process_image_scales()
         
         # 檢查並處理可能產生的 NaN 值 (防護機制)
         if torch.isnan(pred).any():
