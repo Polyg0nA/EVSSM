@@ -105,34 +105,6 @@ def tta_inference(model, img, fp16=False):
         
     return torch.stack(outputs).mean(dim=0)
 
-def rgb_to_ycbcr(tensor):
-    """
-    將 RGB Tensor (shape: B, 3, H, W, 數值範圍: [0, 1]) 轉換為 YCbCr
-    """
-    r = tensor[:, 0:1, :, :]
-    g = tensor[:, 1:2, :, :]
-    b = tensor[:, 2:3, :, :]
-    
-    y = 0.299 * r + 0.587 * g + 0.114 * b
-    cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 0.5
-    cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 0.5
-    
-    return torch.cat([y, cb, cr], dim=1)
-
-def ycbcr_to_rgb(tensor):
-    """
-    將 YCbCr Tensor (shape: B, 3, H, W) 轉換為 RGB (數值範圍限制在 [0, 1])
-    """
-    y = tensor[:, 0:1, :, :]
-    cb = tensor[:, 1:2, :, :] - 0.5
-    cr = tensor[:, 2:3, :, :] - 0.5
-    
-    r = y + 1.402 * cr
-    g = y - 0.344136 * cb - 0.714136 * cr
-    b = y + 1.772 * cb
-    
-    return torch.clamp(torch.cat([r, g, b], dim=1), 0.0, 1.0)
-
 def deblur_one_step(model, img_tensor, args, device):
     """
     對輸入的 Tensor 執行單次去模糊推理（支援 TTA 與 Tiled Inference）。
@@ -300,30 +272,18 @@ def main():
                     curr_tensor = img_tensor_high.clone()
                     scale_desc = "原圖"
                 
-                # 保存原始影像色度資訊
-                ycbcr_low = rgb_to_ycbcr(curr_tensor)
-                
                 pbar_it = tqdm(range(args.iters), desc=f"  -> {img_name} ({scale_desc}) 疊代", leave=False)
                 for it in pbar_it:
                     pbar_it.set_postfix(step=f"{it+1}/{args.iters}")
                     curr_tensor = deblur_one_step(model, curr_tensor, args, device)
-                
-                # 混合：推理出的 Y (亮度) + 原始輸入的 Cb/Cr (色度) -> 避免色調淡化
-                ycbcr_pred = rgb_to_ycbcr(curr_tensor)
-                ycbcr_final = torch.cat([ycbcr_pred[:, 0:1, :, :], ycbcr_low[:, 1:2, :, :], ycbcr_low[:, 2:3, :, :]], dim=1)
-                return ycbcr_to_rgb(ycbcr_final)
+                return curr_tensor
             
-            # 交織多尺度殘差疊代反饋機制 (在 YCbCr 的亮度通道 Y 上進行殘差傳遞)
-            ycbcr_high = rgb_to_ycbcr(img_tensor_high)
-            curr_y = ycbcr_high[:, 0:1, :, :].clone()
-            
+            # 交織多尺度殘差疊代反饋機制
+            curr_high_tensor = img_tensor_high.clone()
             pbar_it = tqdm(range(args.iters), desc=f"  -> {img_name} (多尺度交織疊代)", leave=False)
             for it in pbar_it:
                 pbar_it.set_postfix(step=f"{it+1}/{args.iters}")
-                upsampled_residuals_y = []
-                
-                # 將當前迭代更新的亮度與原始高解析度色度重新組裝為 RGB 輸入給模型
-                curr_high_tensor = ycbcr_to_rgb(torch.cat([curr_y, ycbcr_high[:, 1:2, :, :], ycbcr_high[:, 2:3, :, :]], dim=1))
+                upsampled_residuals = []
                 
                 for scale_val in scale_list:
                     # 1. 下採樣當前的中間高解析度 Tensor 到該尺度
@@ -340,33 +300,29 @@ def main():
                     # 2. 進行單次模型去模糊推理
                     pred_low = deblur_one_step(model, img_tensor_low, args, device)
                     
-                    # 3. 轉為 YCbCr 並計算亮度 Y 通道的殘差
-                    ycbcr_pred_low = rgb_to_ycbcr(pred_low)
-                    ycbcr_input_low = rgb_to_ycbcr(img_tensor_low)
-                    residual_y_low = ycbcr_pred_low[:, 0:1, :, :] - ycbcr_input_low[:, 0:1, :, :]
+                    # 3. 計算本次尺度的去模糊殘差 (去模糊結果 - 本次輸入)
+                    residual_low = pred_low - img_tensor_low
                     
                     # 4. 上採樣殘差回原始尺寸
-                    if residual_y_low.shape[2] != orig_h or residual_y_low.shape[3] != orig_w:
-                        residual_y_high = torch.nn.functional.interpolate(
-                            residual_y_low, size=(orig_h, orig_w), mode='bicubic', align_corners=False
+                    if residual_low.shape[2] != orig_h or residual_low.shape[3] != orig_w:
+                        residual_high = torch.nn.functional.interpolate(
+                            residual_low, size=(orig_h, orig_w), mode='bicubic', align_corners=False
                         )
                     else:
-                        residual_y_high = residual_y_low
+                        residual_high = residual_low
                     
-                    upsampled_residuals_y.append(residual_y_high)
+                    upsampled_residuals.append(residual_high)
                 
-                # 融合本輪所有尺度的亮度殘差 (取平均)
-                fused_residual_y = torch.stack(upsampled_residuals_y).mean(dim=0)
+                # 融合本輪所有尺度的殘差 (取平均)
+                fused_residual = torch.stack(upsampled_residuals).mean(dim=0)
                 
-                # 將融合亮度殘差加回當前亮度通道，更新 curr_y 作為下一次迭代的輸入
-                curr_y = torch.clamp(curr_y + args.alpha * fused_residual_y, 0, 1)
+                # 將融合殘差加回當前大圖，更新 curr_high_tensor 做為下一輪疊代的輸入
+                curr_high_tensor = torch.clamp(curr_high_tensor + args.alpha * fused_residual, 0, 1)
                 
                 # 釋放 GPU 顯存快取，避免多尺度迭代累積顯存
                 torch.cuda.empty_cache()
                 
-            # 迭代結束後，將最終優化的亮度與原始大圖的色度重新組合成 RGB 影像輸出
-            ycbcr_final = torch.cat([curr_y, ycbcr_high[:, 1:2, :, :], ycbcr_high[:, 2:3, :, :]], dim=1)
-            return ycbcr_to_rgb(ycbcr_final)
+            return curr_high_tensor
         
         # 執行主處理流程
         pred = process_image_scales()
