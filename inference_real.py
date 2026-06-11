@@ -278,46 +278,46 @@ def main():
                     curr_tensor = deblur_one_step(model, curr_tensor, args, device)
                 return curr_tensor
             
-            # 交織多尺度殘差疊代反饋機制
+            # 漸進式多尺度級聯反饋機制
             curr_high_tensor = img_tensor_high.clone()
-            pbar_it = tqdm(range(args.iters), desc=f"  -> {img_name} (多尺度交織疊代)", leave=False)
+            pbar_it = tqdm(range(args.iters), desc=f"  -> {img_name} (漸進式級聯迭代)", leave=False)
             for it in pbar_it:
-                pbar_it.set_postfix(step=f"{it+1}/{args.iters}")
-                upsampled_residuals = []
+                # 依迭代輪次取得對應尺度，若超出長度則沿用最後一個尺度
+                if it < len(scale_list):
+                    scale_val = scale_list[it]
+                else:
+                    scale_val = scale_list[-1]
                 
-                for scale_val in scale_list:
-                    # 1. 下採樣當前的中間高解析度 Tensor 到該尺度
-                    if scale_val > 0 and max(orig_w, orig_h) > scale_val:
-                        scale = scale_val / max(orig_w, orig_h)
-                        new_w = max(8, ((int(orig_w * scale)) // 8) * 8)
-                        new_h = max(8, ((int(orig_h * scale)) // 8) * 8)
-                        img_tensor_low = torch.nn.functional.interpolate(
-                            curr_high_tensor, size=(new_h, new_w), mode='bilinear', align_corners=False
-                        )
-                    else:
-                        img_tensor_low = curr_high_tensor.clone()
-                    
-                    # 2. 進行單次模型去模糊推理
-                    pred_low = deblur_one_step(model, img_tensor_low, args, device)
-                    
-                    # 3. 計算本次尺度的去模糊殘差 (去模糊結果 - 本次輸入)
-                    residual_low = pred_low - img_tensor_low
-                    
-                    # 4. 上採樣殘差回原始尺寸
-                    if residual_low.shape[2] != orig_h or residual_low.shape[3] != orig_w:
-                        residual_high = torch.nn.functional.interpolate(
-                            residual_low, size=(orig_h, orig_w), mode='bicubic', align_corners=False
-                        )
-                    else:
-                        residual_high = residual_low
-                    
-                    upsampled_residuals.append(residual_high)
+                scale_desc = f"{scale_val}px" if scale_val > 0 else "原圖"
+                pbar_it.set_postfix(step=f"{it+1}/{args.iters}", size=scale_desc)
                 
-                # 融合本輪所有尺度的殘差 (取平均)
-                fused_residual = torch.stack(upsampled_residuals).mean(dim=0)
+                # 1. 下採樣當前的中間高解析度 Tensor 到當前輪的尺度
+                if scale_val > 0 and max(orig_w, orig_h) > scale_val:
+                    scale = scale_val / max(orig_w, orig_h)
+                    new_w = max(8, ((int(orig_w * scale)) // 8) * 8)
+                    new_h = max(8, ((int(orig_h * scale)) // 8) * 8)
+                    img_tensor_low = torch.nn.functional.interpolate(
+                        curr_high_tensor, size=(new_h, new_w), mode='bilinear', align_corners=False
+                    )
+                else:
+                    img_tensor_low = curr_high_tensor.clone()
                 
-                # 將融合殘差加回當前大圖，更新 curr_high_tensor 做為下一輪疊代的輸入
-                curr_high_tensor = torch.clamp(curr_high_tensor + args.alpha * fused_residual, 0, 1)
+                # 2. 進行該尺度下的單次去模糊推理
+                pred_low = deblur_one_step(model, img_tensor_low, args, device)
+                
+                # 3. 計算本次尺度的去模糊殘差 (去模糊結果 - 本次輸入)
+                residual_low = pred_low - img_tensor_low
+                
+                # 4. 上採樣殘差回原始尺寸
+                if residual_low.shape[2] != orig_h or residual_low.shape[3] != orig_w:
+                    residual_high = torch.nn.functional.interpolate(
+                        residual_low, size=(orig_h, orig_w), mode='bicubic', align_corners=False
+                    )
+                else:
+                    residual_high = residual_low
+                
+                # 5. 更新大圖，作為下一輪迭代的輸入
+                curr_high_tensor = torch.clamp(curr_high_tensor + args.alpha * residual_high, 0, 1)
                 
                 # 釋放 GPU 顯存快取，避免多尺度迭代累積顯存
                 torch.cuda.empty_cache()
