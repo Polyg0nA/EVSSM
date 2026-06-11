@@ -93,7 +93,8 @@ def tta_inference(model, img, fp16=False):
         if flip:
             x = torch.flip(x, [3])
         
-        with torch.amp.autocast('cuda', enabled=fp16):
+        # 加上 torch.inference_mode() 避免保存計算圖（梯度），省下大量記憶體
+        with torch.inference_mode(), torch.amp.autocast('cuda', enabled=fp16):
             pred = model(x).float()
         
         if flip:
@@ -111,33 +112,33 @@ def deblur_one_step(model, img_tensor, args, device):
     _, _, h, w = img_tensor.shape
     use_tile = (h > args.tile_size or w > args.tile_size)
     
-    if args.tta:
-        if use_tile:
-            # 對分塊進行 TTA
-            outputs_tta = []
-            for flip in [False, True]:
-                for rot in [0, 1, 2, 3]:
-                    x = img_tensor.clone()
-                    if rot > 0:
-                        x = torch.rot90(x, rot, [2, 3])
-                    if flip:
-                        x = torch.flip(x, [3])
-                    pred_t = tile_inference(model, x, tile_size=args.tile_size, overlap=args.overlap, fp16=False)
-                    if flip:
-                        pred_t = torch.flip(pred_t, [3])
-                    if rot > 0:
-                        pred_t = torch.rot90(pred_t, -rot, [2, 3])
-                    outputs_tta.append(pred_t)
-            pred = torch.stack(outputs_tta).mean(dim=0)
+    with torch.inference_mode():  # 確保整個函數執行都在推理模式下，不保存梯度
+        if args.tta:
+            if use_tile:
+                # 對分塊進行 TTA
+                outputs_tta = []
+                for flip in [False, True]:
+                    for rot in [0, 1, 2, 3]:
+                        x = img_tensor.clone()
+                        if rot > 0:
+                            x = torch.rot90(x, rot, [2, 3])
+                        if flip:
+                            x = torch.flip(x, [3])
+                        pred_t = tile_inference(model, x, tile_size=args.tile_size, overlap=args.overlap, fp16=False)
+                        if flip:
+                            pred_t = torch.flip(pred_t, [3])
+                        if rot > 0:
+                            pred_t = torch.rot90(pred_t, -rot, [2, 3])
+                        outputs_tta.append(pred_t)
+                pred = torch.stack(outputs_tta).mean(dim=0)
+            else:
+                # 批次 TTA (平行加速)
+                pred = tta_inference(model, img_tensor, fp16=False)
         else:
-            # 批次 TTA (平行加速)
-            pred = tta_inference(model, img_tensor, fp16=False)
-    else:
-        if not use_tile:
-            with torch.inference_mode():
+            if not use_tile:
                 pred = model(img_tensor).float()
-        else:
-            pred = tile_inference(model, img_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=False)
+            else:
+                pred = tile_inference(model, img_tensor, tile_size=args.tile_size, overlap=args.overlap, fp16=False)
             
     return torch.clamp(pred, 0, 1)
 
@@ -317,6 +318,9 @@ def main():
                 
                 # 將融合殘差加回當前大圖，更新 curr_high_tensor 做為下一輪疊代的輸入
                 curr_high_tensor = torch.clamp(curr_high_tensor + args.alpha * fused_residual, 0, 1)
+                
+                # 釋放 GPU 顯存快取，避免多尺度迭代累積顯存
+                torch.cuda.empty_cache()
                 
             return curr_high_tensor
         
